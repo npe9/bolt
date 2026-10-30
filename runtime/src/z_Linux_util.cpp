@@ -1016,6 +1016,19 @@ void __kmp_create_worker(int gtid, kmp_info_t *th, size_t stack_size) {
 
 #else // KMP_USE_ABT
 
+// lithe-docker: ABT_xstream_self_rank() fails on a thread that is not one of
+// BOLT's ESs (e.g. a Python threading thread entering a parallel region) and
+// leaves the rank unset; the callers below used that stack garbage as an index
+// into locals[] (segfault in ABT_thread_revive on a garbage pool, AI
+// concurrent_infer, 2026-10-29).  Such a thread uses ES 0's pools.
+static inline int __kmp_abt_self_rank_or0(void) {
+  int rank;
+  if (ABT_xstream_self_rank(&rank) != ABT_SUCCESS || rank < 0
+      || rank >= __kmp_abt_global.num_xstreams)
+    return 0;
+  return rank;
+}
+
 static inline void __kmp_abt_create_workers_impl(kmp_team_t *team,
                                                  const int self_rank,
                                                  int start_tid, int end_tid) {
@@ -1130,7 +1143,7 @@ static inline void __kmp_abt_create_workers_impl(kmp_team_t *team,
 static void __kmp_abt_create_workers_recursive(kmp_team_t *team, int start_tid,
                                                int end_tid) {
   int self_rank;
-  ABT_xstream_self_rank(&self_rank);
+  self_rank = __kmp_abt_self_rank_or0();
   __kmp_abt_create_workers_impl(team, self_rank, start_tid, end_tid);
 }
 
@@ -1145,7 +1158,7 @@ void __kmp_abt_create_workers(kmp_team_t *team) {
 
   // Get self_rank
   int self_rank;
-  ABT_xstream_self_rank(&self_rank);
+  self_rank = __kmp_abt_self_rank_or0();
 
   // Set up proc bind.
   kmp_proc_bind_t proc_bind = proc_bind_false;
@@ -3548,7 +3561,7 @@ static inline ABT_pool __kmp_abt_get_pool_thread(int self_rank,
 
 static inline ABT_pool __kmp_abt_get_pool_task() {
   int self_rank;
-  ABT_xstream_self_rank(&self_rank);
+  self_rank = __kmp_abt_self_rank_or0();
   return __kmp_abt_global.locals[self_rank].shared_pool;
 }
 
@@ -3792,6 +3805,19 @@ static void __kmp_abt_initialize(void) {
     if (verbose)
       printf("KMP_ABT_WORK_STEAL_FREQ = %ud\n",
              (unsigned int)__kmp_abt_global.work_steal_freq);
+
+    // lithe-docker: as shipped, a stealing ES takes any ULT from another ES's
+    // pool -- including the primary ULT, the process's main thread.  Argobots
+    // ULTs do not carry TLS, so after a steal the main program reads another
+    // kernel thread's thread_locals: PyTorch's autograd ReadyQueue pointer is
+    // NULL there (segfault in every training case, 2026-10-29,
+    // .build_logs/bolt_ai_20261029).  =0 leaves non-migratable ULTs to the ES
+    // whose pool they are in.
+    env = getenv("KMP_ABT_STEAL_UNMIGRATABLE");
+    __kmp_abt_global.steal_unmigratable = !(env && env[0] == '0');
+    if (verbose)
+      printf("KMP_ABT_STEAL_UNMIGRATABLE = %d\n",
+             __kmp_abt_global.steal_unmigratable);
   }
 
   KA_TRACE(10, ("__kmp_abt_initialize: # of ESs = %d\n", num_xstreams));
@@ -3939,6 +3965,7 @@ static void __kmp_abt_sched_run(ABT_sched sched) {
   const uint32_t sched_event_freq_mask = sched_event_freq - 1;
   KMP_DEBUG_ASSERT(!(work_steal_freq & (work_steal_freq - 1))); // must be 2^N
   const uint32_t work_steal_freq_mask = work_steal_freq - 1;
+  const int steal_unmigratable = __kmp_abt_global.steal_unmigratable;
 
   ABT_sched_get_num_pools(sched, &num_pools);
   shared_pools = (ABT_pool *)alloca(num_pools * sizeof(ABT_pool));
@@ -3971,6 +3998,16 @@ static void __kmp_abt_sched_run(ABT_sched sched) {
       int target = __kmp_abt_fast_rand32(&seed) %
                    ((uint32_t)(num_shared_pools - 1)) + 1;
       ABT_pool_pop(shared_pools[target], &unit);
+      if (unit != ABT_UNIT_NULL && !steal_unmigratable) {
+        ABT_thread t;
+        ABT_bool mig = ABT_TRUE;
+        if (ABT_unit_get_thread(unit, &t) == ABT_SUCCESS && t != ABT_THREAD_NULL)
+          ABT_thread_is_migratable(t, &mig);
+        if (mig == ABT_FALSE) {
+          ABT_pool_push(shared_pools[target], unit);
+          unit = ABT_UNIT_NULL;
+        }
+      }
       if (unit != ABT_UNIT_NULL) {
         ABT_unit_set_associated_pool(unit, shared_pools[0]);
         ABT_xstream_run_unit(unit, shared_pools[0]);
@@ -4213,7 +4250,7 @@ kmp_info_t *__kmp_abt_bind_task_to_thread(kmp_team_t *team,
       /* outermost team - we try to assign the thread that was executed on
        * the same ES first and then check other threads in the team.  */
       int rank;
-      ABT_xstream_self_rank(&rank);
+      rank = __kmp_abt_self_rank_or0();
       if (rank < team->t.t_nproc) {
         /* [SM] I think this condition should always be true, but just in
          * case I miss something we check this condition. */

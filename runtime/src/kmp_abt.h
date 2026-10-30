@@ -65,6 +65,9 @@ typedef struct kmp_abt_global {
   int sched_sleep_max_nsec;
   int sched_event_freq;
   uint32_t work_steal_freq;
+  /* lithe-docker: KMP_ABT_STEAL_UNMIGRATABLE=0 never steals a non-migratable
+     ULT (the primary ULT is one); default 1 = as shipped.  */
+  int steal_unmigratable;
   int num_places;
   ABT_pool *place_pools;
 
